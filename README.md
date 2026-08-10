@@ -42,8 +42,8 @@ aspettati di dover togliere qualcos'altro.
 ## Cosa sa fare
 
 - **Conversazione vocale** con modelli linguistici di grandi dimensioni, in streaming audio Opus
-- **Wake word offline** tramite [ESP-SR](https://github.com/espressif/esp-sr): si sveglia da solo,
-  senza premere niente
+- **Avvio manuale**, senza wake word: Peppe ascolta quando glielo chiedi tu (vedi
+  [Niente wake word](#niente-wake-word))
 - **Espressioni animate** sul display, sincronizzate con il tono della conversazione
 - **Movimenti**: il modello può comandare il corpo del cane, non solo rispondere a parole
 - **LED RGB** controllabili a voce
@@ -64,6 +64,44 @@ lo scopre da solo, senza bisogno di riaddestrare o riconfigurare nulla lato serv
 Con telefono e Peppe sulla stessa rete Wi-Fi, apri `http://esp-hi.local/` per controllare i
 movimenti manualmente. Si disattiva da menuconfig, sotto
 `Component config` → `Servo Dog Configuration` → `Web Control`.
+
+## Niente wake word
+
+Peppe **non** ascolta in attesa di una parola magica: il riconoscimento della wake word è disattivato
+di proposito in [config.json](main/boards/espressif/esp-hi/config.json).
+
+```jsonc
+"CONFIG_SR_WN_WN9S_NIHAOXIAOZHI=n",   // il modello non finisce nella partizione assets
+"CONFIG_USE_ESP_WAKE_WORD=n",         // nessun motore di riconoscimento
+"CONFIG_WAKE_WORD_DISABLED=y",        // scelta esplicita, non un ripiego
+```
+
+Le tre righe fanno cose diverse e servono tutte e tre. Le ultime due spengono il motore ESP-SR; la
+prima impedisce che il modello acustico `wn9s_nihaoxiaozhi`, attivato per tutti gli ESP32-C3 da
+[sdkconfig.defaults.esp32c3](sdkconfig.defaults.esp32c3), venga comunque impacchettato nella
+partizione `assets`. Senza quella riga ti porteresti dietro il peso di un modello mai usato, su una
+flash da 4 MB.
+
+### Come si avvia una conversazione, allora
+
+Due modi, entrambi già nel firmware:
+
+- **Il pulsante BOOT** (GPIO 9): un clic avvia o interrompe la conversazione
+- **Il gesto**: una sequenza di tocchi sul sensore di movimento (GPIO 0) — una pausa lunga seguita da
+  un tocco rapido — fa la stessa cosa senza toccare pulsanti, vedi
+  [esp_hi.cc:139-164](main/boards/espressif/esp-hi/esp_hi.cc#L139-L164)
+
+### Se un giorno la rivuoi
+
+L'hardware la supporta ancora, è solo spenta per scelta. Si riattiva al volo per una singola build,
+senza toccare i file:
+
+```bash
+python ./scripts/build.py espressif/esp-hi --wake-word nihaoxiaozhi
+```
+
+Per renderla di nuovo permanente, rimetti `CONFIG_USE_ESP_WAKE_WORD=y` in `config.json` al posto
+delle tre righe qui sopra.
 
 ## Cosa serve per lavorarci
 
@@ -88,23 +126,23 @@ le applica al posto tuo.
 python ./scripts/build.py espressif/esp-hi
 ```
 
-In italiano, con la wake word predefinita:
+In italiano:
 
 ```bash
 python ./scripts/build.py espressif/esp-hi --language it-IT
 ```
 
 Le lingue disponibili sono in [main/assets/locales/](main/assets/locales/) — l'italiano c'è,
-`it-IT`. Per l'elenco completo di lingue e wake word:
+`it-IT`. Per l'elenco completo:
 
 ```bash
 python ./scripts/build.py --list-languages
-python ./scripts/build.py --list-wake-words
 ```
 
-Attenzione a una regola non ovvia sulla wake word: l'ESP32-C3 può usare **solo i modelli "lite"**,
-quelli con prefisso `wn9s_`. Il valore predefinito è `wn9s_nihaoxiaozhi` ("nǐ hǎo xiǎo zhì"). Se
-passi un modello `wn9_` senza la `s` la build si ferma con un errore esplicito.
+La wake word è disattivata di default, come spiegato sopra. Se decidi di riattivarla, tieni presente
+una regola non ovvia: l'ESP32-C3 accetta **solo i modelli "lite"**, quelli con prefisso `wn9s_`.
+Passare un modello `wn9_` senza la `s` fa fallire la build con un errore esplicito. L'elenco dei
+modelli disponibili si ottiene con `python ./scripts/build.py --list-wake-words`.
 
 ## Caricare il firmware
 
