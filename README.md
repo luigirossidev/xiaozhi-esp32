@@ -8,7 +8,7 @@ sola scheda: la ESP-HI**. Il progetto originale supporta oltre 130 board diverse
 non riguarda ESP-HI è semplicemente rumore, quindi documentazione, comandi ed esempi parlano di
 quella e basta.
 
-Base di partenza: xiaozhi-esp32 v2.4.2. Il codice sorgente resta allineato all'upstream, così le
+Base di partenza: xiaozhi-esp32 v2.5.4. Il codice sorgente resta allineato all'upstream, così le
 migliorie del progetto originale continuano ad arrivare (vedi [Restare allineati con
 l'upstream](#restare-allineati-con-lupstream)).
 
