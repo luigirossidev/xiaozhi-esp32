@@ -170,10 +170,13 @@ private:
     // text message ("listen"/"detect"), but the server only accepts it for
     // wake words and rejects anything longer than about 30 characters.
     //
-    // The client must pace the upload: first packet, a pause while the audio
-    // channel opens, then the rest at about twice real time. Unread data
-    // sitting in the socket holds the few Wi-Fi RX buffers this board has, and
-    // the server hello can no longer get in.
+    //
+    // A client should first call POST /speak/begin (empty body), which opens
+    // the audio channel and answers only once the server is listening, and
+    // send the audio after that. Posting to /speak directly also works, but
+    // then the audio travels while the channel is still being opened: unread
+    // data sitting in the socket holds the few Wi-Fi RX buffers this board
+    // has, and the server hello may no longer get in.
     //
     // Query parameters, all optional, meant for tuning without reflashing:
     //   fd    frame duration of each packet in ms (default 60)
@@ -206,6 +209,34 @@ private:
         return true;
     }
 
+    // Opens the conversation for an injected utterance. On failure the error
+    // response has already been sent and ESP_ERR_INVALID_STATE is returned.
+    static esp_err_t BeginSpeech(httpd_req_t* req)
+    {
+        auto& app = Application::GetInstance();
+        httpd_resp_set_type(req, "application/json");
+        if (!app.BeginInjectedSpeech()) {
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"busy\"}");
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (!app.WaitInjectedSpeechReady(15000)) {
+            app.EndInjectedSpeech();
+            httpd_resp_set_status(req, "504 Gateway Timeout");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"server\"}");
+            return ESP_ERR_INVALID_STATE;
+        }
+        return ESP_OK;
+    }
+
+    static esp_err_t SpeakBeginHandler(httpd_req_t* req)
+    {
+        if (BeginSpeech(req) != ESP_OK) {
+            return ESP_OK;
+        }
+        return httpd_resp_sendstr(req, "{\"ok\":true}");
+    }
+
     static esp_err_t SpeakHandler(httpd_req_t* req)
     {
         static constexpr size_t kMaxBody = 256 * 1024;
@@ -222,14 +253,12 @@ private:
         int pace = QueryInt(req, "pace", frame_duration / 2);
 
         auto& app = Application::GetInstance();
-        if (!app.BeginInjectedSpeech()) {
-            httpd_resp_set_status(req, "409 Conflict");
-            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"busy\"}");
-        }
-        if (!app.WaitInjectedSpeechReady(15000)) {
-            app.EndInjectedSpeech();
-            httpd_resp_set_status(req, "504 Gateway Timeout");
-            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"server\"}");
+        // Already begun through /speak/begin? Then go straight to the audio.
+        if (!app.IsInjectedSpeechReady()) {
+            esp_err_t err = BeginSpeech(req);
+            if (err != ESP_OK) {
+                return err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+            }
         }
 
         size_t remaining = req->content_len;
@@ -277,7 +306,8 @@ private:
         return httpd_resp_sendstr(req, reply);
     }
 
-    // Peppe's own HTTP server, on port 8080: POST /speak and GET /log.
+    // Peppe's own HTTP server, on port 8080: POST /speak/begin, POST /speak
+    // and GET /log.
     //
     // It is separate from the web control server on port 80 because that one
     // keeps its handle private inside the servo_dog_ctrl managed component, so
@@ -289,7 +319,7 @@ private:
         config.ctrl_port = 32769;  // the web control server already owns the default one
         config.stack_size = 6144;
         config.max_open_sockets = 2;
-        config.max_uri_handlers = 2;
+        config.max_uri_handlers = 3;
         config.lru_purge_enable = true;
 
         httpd_handle_t server = nullptr;
@@ -312,6 +342,13 @@ private:
             .user_ctx = nullptr,
         };
         httpd_register_uri_handler(server, &speak_uri);
+        static const httpd_uri_t speak_begin_uri = {
+            .uri = "/speak/begin",
+            .method = HTTP_POST,
+            .handler = SpeakBeginHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &speak_begin_uri);
         ESP_LOGI(TAG, "Peppe server listening on port 8080");
     }
 

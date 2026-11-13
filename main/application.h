@@ -120,11 +120,15 @@ public:
      *   SendInjectedAudio() ...      one Opus packet at a time
      *   EndInjectedSpeech()          tells the server the utterance is over
      *
-     * All four are meant to be called from a task other than the main one.
-     * Microphone audio is discarded for the whole duration.
+     * All of them are meant to be called from a task other than the main one.
+     * Microphone audio is discarded for the whole duration. Once ready, the
+     * audio channel is closed if no packet arrives for a few seconds, so a
+     * caller that goes away cannot leave the device listening.
      */
+    enum InjectPhase { kInjectNone, kInjectStarting, kInjectReady, kInjectFailed };
     bool BeginInjectedSpeech();
     bool WaitInjectedSpeechReady(int timeout_ms);
+    bool IsInjectedSpeechReady() const { return injecting_audio_ && inject_phase_ == kInjectReady; }
     bool SendInjectedAudio(std::unique_ptr<AudioStreamPacket> packet);
     void EndInjectedSpeech();
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -144,6 +148,10 @@ public:
     void ResetProtocol();
 
 private:
+    // Injected speech state, declared first because a public inline reads it
+    std::atomic<bool> injecting_audio_{false};
+    std::atomic<int> inject_phase_{kInjectNone};
+
     Application();
     ~Application();
 
@@ -172,10 +180,9 @@ private:
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     // Injected speech (see BeginInjectedSpeech)
-    enum InjectPhase { kInjectNone, kInjectStarting, kInjectReady, kInjectFailed };
-    std::atomic<bool> injecting_audio_{false};
-    std::atomic<int> inject_phase_{kInjectNone};
-    int inject_reply_timeout_ticks_ = 0;  // seconds left to wait for the reply
+    // Seconds left before giving up: on the next packet while the utterance
+    // is being sent, on the reply once it is over. 0 means no deadline.
+    std::atomic<int> inject_timeout_ticks_{0};
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;

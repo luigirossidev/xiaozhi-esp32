@@ -22,6 +22,11 @@
 
 #define TAG "Application"
 
+// Injected speech deadlines: how long to wait for the next packet while the
+// utterance is being sent, and for the reply once it is over.
+static constexpr int kInjectAudioTimeoutSeconds = 10;
+static constexpr int kInjectReplyTimeoutSeconds = 20;
+
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
 
@@ -297,11 +302,12 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
-            if (injecting_audio_ && inject_reply_timeout_ticks_ > 0 &&
-                --inject_reply_timeout_ticks_ == 0 && GetDeviceState() == kDeviceStateListening) {
-                // The server never answered the injected utterance (nothing
-                // recognized, most likely): do not sit in listening forever.
-                ESP_LOGW(TAG, "No reply to injected speech, closing audio channel");
+            if (injecting_audio_ && inject_timeout_ticks_ > 0 && --inject_timeout_ticks_ == 0 &&
+                GetDeviceState() == kDeviceStateListening) {
+                // Either the caller stopped sending audio, or the server never
+                // answered the utterance (nothing recognized, most likely):
+                // do not sit in listening forever.
+                ESP_LOGW(TAG, "Injected speech timed out, closing audio channel");
                 protocol_->CloseAudioChannel();
             }
             auto display = Board::GetInstance().GetDisplay();
@@ -1042,11 +1048,9 @@ void Application::HandleStateChangedEvent() {
     clock_ticks_ = 0;
     if (new_state != kDeviceStateConnecting && new_state != kDeviceStateListening) {
         // Injected speech only lives across connecting -> listening
-        if (inject_phase_ == kInjectStarting) {
-            inject_phase_ = kInjectFailed;
-        }
+        inject_phase_ = inject_phase_ == kInjectStarting ? kInjectFailed : kInjectNone;
         injecting_audio_ = false;
-        inject_reply_timeout_ticks_ = 0;
+        inject_timeout_ticks_ = 0;
     }
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
@@ -1200,6 +1204,7 @@ void Application::StartListeningAudio() {
     protocol_->SendStartListening(listening_mode_);
     audio_service_.EnableVoiceProcessing(true);
     if (injecting_audio_) {
+        inject_timeout_ticks_ = kInjectAudioTimeoutSeconds;
         inject_phase_ = kInjectReady;
     }
 
@@ -1467,6 +1472,7 @@ bool Application::SendInjectedAudio(std::unique_ptr<AudioStreamPacket> packet) {
     if (!injecting_audio_ || inject_phase_ != kInjectReady || !protocol_) {
         return false;
     }
+    inject_timeout_ticks_ = kInjectAudioTimeoutSeconds;
     return protocol_->SendAudio(std::move(packet));
 }
 
@@ -1480,7 +1486,7 @@ void Application::EndInjectedSpeech() {
             protocol_->SendStopListening();
             // Keep discarding the microphone until the reply starts; the
             // clock tick closes the channel if it never does.
-            inject_reply_timeout_ticks_ = 20;
+            inject_timeout_ticks_ = kInjectReplyTimeoutSeconds;
         } else {
             injecting_audio_ = false;
         }

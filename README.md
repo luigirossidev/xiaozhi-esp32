@@ -231,24 +231,29 @@ percorsi.
 | Percorso | Cosa fa |
 | --- | --- |
 | `GET /log` | Restituisce gli ultimi 4 kB di log. Con il corpo montato l'USB è occupata dai servo e la console è disattivata: questo è l'unico modo di vedere cosa succede. |
+| `POST /speak/begin` | Apre la conversazione col server e risponde solo quando il server è in ascolto. Corpo vuoto. |
 | `POST /speak` | Riceve pacchetti Opus e li inoltra all'assistente **al posto del microfono**, come una frase detta con il tasto premuto. È ciò che usa l'app per far dire a Peppe una frase scritta. |
 
 Il corpo di `/speak` è una sequenza di pacchetti Opus (16 kHz mono), ciascuno preceduto dalla sua
 lunghezza su due byte big-endian. Parametri facoltativi nella query: `fd` (durata di ogni pacchetto
 in ms, predefinito 60), `sr` (frequenza, predefinito 16000), `pace` (pausa in ms fra un pacchetto e
 l'altro, predefinito `fd / 2`). Risponde `409` se Peppe non è a riposo e `504` se non riesce ad
-aprire la conversazione col server.
+aprire la conversazione col server; valgono anche per `/speak/begin`.
 
-Due cose da sapere prima di scrivere un client:
+Tre cose da sapere prima di scrivere un client:
 
 - **Il testo scritto non è un'alternativa.** Il protocollo ha un messaggio di testo
   (`listen`/`detect`), ma il server lo accetta solo come parola di risveglio e rifiuta tutto ciò che
   supera una trentina di caratteri. Per questo la frase viaggia come audio.
-- **L'invio va dosato.** Il C3 ha pochissimi buffer di ricezione Wi-Fi: se l'audio arriva tutto
-  insieme mentre Peppe sta ancora aprendo la conversazione, la risposta del server non riesce più a
-  entrare e la richiesta finisce in timeout. La sequenza che funziona è: primo pacchetto, una pausa
-  di un paio di secondi, poi il resto a circa il doppio della velocità del parlato. Inoltre il
-  server HTTP non avvia l'elaborazione finché non arriva almeno un byte di corpo.
+- **Prima `/speak/begin`, poi `/speak`.** Il C3 ha pochissimi buffer di ricezione Wi-Fi: se l'audio
+  arriva mentre Peppe sta ancora aprendo la conversazione, i dati non letti li tengono occupati e la
+  risposta del server non riesce più a entrare, con la richiesta che finisce in timeout. Chiamando
+  prima `/speak/begin` e aspettandone la risposta il problema non può presentarsi. Mandare tutto a
+  `/speak` in un colpo solo resta possibile, ma funziona in modo affidabile solo a conversazione
+  già aperta.
+- **L'audio va inviato a ritmo**, circa al doppio della velocità del parlato (un pacchetto da 60 ms
+  ogni 30 ms, con `pace=0`). Dopo `/speak/begin`, se per dieci secondi non arriva alcun pacchetto
+  Peppe chiude la conversazione da solo.
 
 ## Restare allineati con l'upstream
 
