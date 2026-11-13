@@ -258,6 +258,11 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                if (injecting_audio_) {
+                    // The utterance comes from SendInjectedAudio(): keep
+                    // draining the queue, but do not send the microphone.
+                    continue;
+                }
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     // Drop the remaining packets. Leaving them in the queue would
                     // stall the Opus codec task (it waits for queue space), which in
@@ -292,6 +297,13 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            if (injecting_audio_ && inject_reply_timeout_ticks_ > 0 &&
+                --inject_reply_timeout_ticks_ == 0 && GetDeviceState() == kDeviceStateListening) {
+                // The server never answered the injected utterance (nothing
+                // recognized, most likely): do not sit in listening forever.
+                ESP_LOGW(TAG, "No reply to injected speech, closing audio channel");
+                protocol_->CloseAudioChannel();
+            }
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -1028,6 +1040,14 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;
+    if (new_state != kDeviceStateConnecting && new_state != kDeviceStateListening) {
+        // Injected speech only lives across connecting -> listening
+        if (inject_phase_ == kInjectStarting) {
+            inject_phase_ = kInjectFailed;
+        }
+        injecting_audio_ = false;
+        inject_reply_timeout_ticks_ = 0;
+    }
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
@@ -1179,6 +1199,9 @@ void Application::StartListeningAudio() {
     // Send the start listening command
     protocol_->SendStartListening(listening_mode_);
     audio_service_.EnableVoiceProcessing(true);
+    if (injecting_audio_) {
+        inject_phase_ = kInjectReady;
+    }
 
     ConfigureWakeWordForListening();
 
@@ -1396,6 +1419,72 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
             }
         });
     }
+}
+
+bool Application::BeginInjectedSpeech() {
+    if (!protocol_ || GetDeviceState() != kDeviceStateIdle || injecting_audio_) {
+        return false;
+    }
+    injecting_audio_ = true;
+    inject_phase_ = kInjectStarting;
+
+    Schedule([this]() {
+        if (GetDeviceState() != kDeviceStateIdle || !SetDeviceState(kDeviceStateConnecting)) {
+            injecting_audio_ = false;
+            inject_phase_ = kInjectFailed;
+            return;
+        }
+        // Same two-step sequence as HandleStartListeningEvent()
+        Schedule([this]() {
+            ContinueOpenAudioChannel(kListeningModeManualStop);
+            // On success the state is now listening and StartListeningAudio()
+            // will flag the injection as ready once "listen start" is sent.
+            auto state = GetDeviceState();
+            if (state != kDeviceStateListening && state != kDeviceStateConnecting) {
+                injecting_audio_ = false;
+                inject_phase_ = kInjectFailed;
+            }
+        });
+    });
+    return true;
+}
+
+bool Application::WaitInjectedSpeechReady(int timeout_ms) {
+    for (int waited = 0; waited < timeout_ms; waited += 50) {
+        int phase = inject_phase_;
+        if (phase == kInjectReady) {
+            return true;
+        }
+        if (phase != kInjectStarting) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
+bool Application::SendInjectedAudio(std::unique_ptr<AudioStreamPacket> packet) {
+    if (!injecting_audio_ || inject_phase_ != kInjectReady || !protocol_) {
+        return false;
+    }
+    return protocol_->SendAudio(std::move(packet));
+}
+
+void Application::EndInjectedSpeech() {
+    inject_phase_ = kInjectNone;
+    Schedule([this]() {
+        if (!injecting_audio_) {
+            return;
+        }
+        if (GetDeviceState() == kDeviceStateListening) {
+            protocol_->SendStopListening();
+            // Keep discarding the microphone until the reply starts; the
+            // clock tick closes the channel if it never does.
+            inject_reply_timeout_ticks_ = 20;
+        } else {
+            injecting_audio_ = false;
+        }
+    });
 }
 
 bool Application::CanEnterSleepMode() {

@@ -9,6 +9,7 @@
 #include <string>
 #include <mutex>
 #include <deque>
+#include <atomic>
 #include <memory>
 #include <functional>
 #include <cstdint>
@@ -110,6 +111,22 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
+    /**
+     * Injected speech: talk to the assistant with pre-recorded Opus audio
+     * instead of the microphone, as a push-to-talk utterance.
+     *
+     *   BeginInjectedSpeech()        idle only; opens the audio channel
+     *   WaitInjectedSpeechReady()    blocks until the server is listening
+     *   SendInjectedAudio() ...      one Opus packet at a time
+     *   EndInjectedSpeech()          tells the server the utterance is over
+     *
+     * All four are meant to be called from a task other than the main one.
+     * Microphone audio is discarded for the whole duration.
+     */
+    bool BeginInjectedSpeech();
+    bool WaitInjectedSpeechReady(int timeout_ms);
+    bool SendInjectedAudio(std::unique_ptr<AudioStreamPacket> packet);
+    void EndInjectedSpeech();
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
@@ -154,6 +171,11 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    // Injected speech (see BeginInjectedSpeech)
+    enum InjectPhase { kInjectNone, kInjectStarting, kInjectReady, kInjectFailed };
+    std::atomic<bool> injecting_audio_{false};
+    std::atomic<int> inject_phase_{kInjectNone};
+    int inject_reply_timeout_ticks_ = 0;  // seconds left to wait for the reply
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;

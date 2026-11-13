@@ -29,6 +29,14 @@
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
 #include "esp_hi_web_control.h"
+#include <esp_http_server.h>
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
 #endif //CONFIG_ESP_HI_WEB_CONTROL_ENABLED
 
 #define TAG "ESP_HI"
@@ -101,6 +109,212 @@ private:
     bool led_on_ = false;
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
+    // Peppe: in-memory log, readable with GET http://<ip>:8080/log.
+    //
+    // This board has no usable console: CONFIG_ESP_CONSOLE_NONE is set and the
+    // USB-C connector is taken by the servos once the body is attached. The
+    // last few kB of log are kept in RAM so that problems can be diagnosed over
+    // Wi-Fi instead of taking the robot apart.
+    static constexpr size_t kLogSize = 4096;
+    static inline char log_buffer_[kLogSize];
+    static inline size_t log_head_ = 0;      // next write position
+    static inline bool log_wrapped_ = false;
+    static inline portMUX_TYPE log_lock_ = portMUX_INITIALIZER_UNLOCKED;
+
+    static int LogVprintf(const char* format, va_list args)
+    {
+        char line[160];
+        int len = vsnprintf(line, sizeof(line), format, args);
+        if (len <= 0) {
+            return len;
+        }
+        size_t count = std::min(static_cast<size_t>(len), sizeof(line) - 1);
+        portENTER_CRITICAL(&log_lock_);
+        for (size_t i = 0; i < count; i++) {
+            log_buffer_[log_head_] = line[i];
+            if (++log_head_ == kLogSize) {
+                log_head_ = 0;
+                log_wrapped_ = true;
+            }
+        }
+        portEXIT_CRITICAL(&log_lock_);
+        return len;
+    }
+
+    static esp_err_t LogHandler(httpd_req_t* req)
+    {
+        // Snapshot under the lock, then send without it.
+        std::string snapshot;
+        snapshot.resize(kLogSize);
+        size_t size = 0;
+        portENTER_CRITICAL(&log_lock_);
+        if (log_wrapped_) {
+            memcpy(snapshot.data(), log_buffer_ + log_head_, kLogSize - log_head_);
+            memcpy(snapshot.data() + kLogSize - log_head_, log_buffer_, log_head_);
+            size = kLogSize;
+        } else {
+            memcpy(snapshot.data(), log_buffer_, log_head_);
+            size = log_head_;
+        }
+        portEXIT_CRITICAL(&log_lock_);
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_send(req, snapshot.data(), size);
+    }
+
+    // Peppe: "speak through the assistant" endpoint.
+    //
+    // POST http://<ip>:8080/speak with a body made of Opus packets, each one
+    // preceded by its length as a big-endian uint16. The packets are sent to
+    // the assistant in place of the microphone, as one push-to-talk utterance,
+    // so the reply is spoken with the usual voice. The protocol also has a
+    // text message ("listen"/"detect"), but the server only accepts it for
+    // wake words and rejects anything longer than about 30 characters.
+    //
+    // The client must pace the upload: first packet, a pause while the audio
+    // channel opens, then the rest at about twice real time. Unread data
+    // sitting in the socket holds the few Wi-Fi RX buffers this board has, and
+    // the server hello can no longer get in.
+    //
+    // Query parameters, all optional, meant for tuning without reflashing:
+    //   fd    frame duration of each packet in ms (default 60)
+    //   sr    sample rate in Hz (default 16000)
+    //   pace  delay between packets in ms (default fd / 2)
+    static int QueryInt(httpd_req_t* req, const char* key, int fallback)
+    {
+        char query[64];
+        char value[12];
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+            httpd_query_key_value(query, key, value, sizeof(value)) == ESP_OK) {
+            return atoi(value);
+        }
+        return fallback;
+    }
+
+    static bool RecvAll(httpd_req_t* req, uint8_t* data, size_t size)
+    {
+        size_t received = 0;
+        while (received < size) {
+            int ret = httpd_req_recv(req, reinterpret_cast<char*>(data) + received, size - received);
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            if (ret <= 0) {
+                return false;
+            }
+            received += ret;
+        }
+        return true;
+    }
+
+    static esp_err_t SpeakHandler(httpd_req_t* req)
+    {
+        static constexpr size_t kMaxBody = 256 * 1024;
+        static constexpr size_t kMaxPacket = 1275 * 3 + 16;  // three Opus frames
+
+        httpd_resp_set_type(req, "application/json");
+        if (req->content_len < 3 || req->content_len > kMaxBody) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"length\"}");
+        }
+
+        int frame_duration = QueryInt(req, "fd", 60);
+        int sample_rate = QueryInt(req, "sr", 16000);
+        int pace = QueryInt(req, "pace", frame_duration / 2);
+
+        auto& app = Application::GetInstance();
+        if (!app.BeginInjectedSpeech()) {
+            httpd_resp_set_status(req, "409 Conflict");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"busy\"}");
+        }
+        if (!app.WaitInjectedSpeechReady(15000)) {
+            app.EndInjectedSpeech();
+            httpd_resp_set_status(req, "504 Gateway Timeout");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"server\"}");
+        }
+
+        size_t remaining = req->content_len;
+        int packets = 0;
+        bool ok = true;
+        while (remaining > 2) {
+            uint8_t header[2];
+            if (!RecvAll(req, header, sizeof(header))) {
+                ok = false;
+                break;
+            }
+            remaining -= 2;
+            size_t length = (header[0] << 8) | header[1];
+            if (length == 0 || length > kMaxPacket || length > remaining) {
+                ok = false;
+                break;
+            }
+            auto packet = std::make_unique<AudioStreamPacket>();
+            packet->sample_rate = sample_rate;
+            packet->frame_duration = frame_duration;
+            packet->payload.resize(length);
+            if (!RecvAll(req, packet->payload.data(), length)) {
+                ok = false;
+                break;
+            }
+            remaining -= length;
+            if (!app.SendInjectedAudio(std::move(packet))) {
+                ok = false;
+                break;
+            }
+            packets++;
+            if (pace > 0) {
+                vTaskDelay(pdMS_TO_TICKS(pace));
+            }
+        }
+        app.EndInjectedSpeech();
+        ESP_LOGI(TAG, "Injected speech: %d packets, ok=%d", packets, ok);
+
+        if (!ok) {
+            // The connection is in an unknown state: let httpd close it.
+            return ESP_FAIL;
+        }
+        char reply[48];
+        snprintf(reply, sizeof(reply), "{\"ok\":true,\"packets\":%d}", packets);
+        return httpd_resp_sendstr(req, reply);
+    }
+
+    // Peppe's own HTTP server, on port 8080: POST /speak and GET /log.
+    //
+    // It is separate from the web control server on port 80 because that one
+    // keeps its handle private inside the servo_dog_ctrl managed component, so
+    // no handler can be added to it from here.
+    static void StartPeppeServer()
+    {
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = 8080;
+        config.ctrl_port = 32769;  // the web control server already owns the default one
+        config.stack_size = 6144;
+        config.max_open_sockets = 2;
+        config.max_uri_handlers = 2;
+        config.lru_purge_enable = true;
+
+        httpd_handle_t server = nullptr;
+        esp_err_t err = httpd_start(&server, &config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start Peppe server: %d", err);
+            return;
+        }
+        static const httpd_uri_t log_uri = {
+            .uri = "/log",
+            .method = HTTP_GET,
+            .handler = LogHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &log_uri);
+        static const httpd_uri_t speak_uri = {
+            .uri = "/speak",
+            .method = HTTP_POST,
+            .handler = SpeakHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &speak_uri);
+        ESP_LOGI(TAG, "Peppe server listening on port 8080");
+    }
+
     static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                  int32_t event_id, void* event_data)
     {
@@ -120,6 +334,7 @@ private:
                         } else {
                             ESP_LOGI(TAG, "Web control server initialized");
                             instance->web_server_initialized_ = true;
+                            StartPeppeServer();
                         }
                     }
 
@@ -420,6 +635,9 @@ public:
         audio_wake_button_(AUDIO_WAKE_BUTTON_GPIO),
         move_wake_button_(MOVE_WAKE_BUTTON_GPIO)
     {
+#ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
+        esp_log_set_vprintf(LogVprintf);
+#endif
         InitializeButtons();
         InitializeIot();
         InitializeSpi();
