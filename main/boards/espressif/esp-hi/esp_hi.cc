@@ -30,6 +30,7 @@
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
 #include "esp_hi_web_control.h"
 #include <esp_http_server.h>
+#include <esp_app_desc.h>
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -159,6 +160,19 @@ private:
         portEXIT_CRITICAL(&log_lock_);
         httpd_resp_set_type(req, "text/plain; charset=utf-8");
         return httpd_resp_send(req, snapshot.data(), size);
+    }
+
+    // Peppe: firmware version, GET http://<ip>:8080/version.
+    //
+    // The mobile app compares it with the latest release published on the
+    // portal, to tell the user when an update is available. It is PROJECT_VER
+    // from the top-level CMakeLists.txt, e.g. {"version":"2.5.4"}.
+    static esp_err_t VersionHandler(httpd_req_t* req)
+    {
+        char reply[64];
+        snprintf(reply, sizeof(reply), "{\"version\":\"%s\"}", esp_app_get_description()->version);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, reply);
     }
 
     // Peppe: "speak through the assistant" endpoint.
@@ -306,8 +320,8 @@ private:
         return httpd_resp_sendstr(req, reply);
     }
 
-    // Peppe's own HTTP server, on port 8080: POST /speak/begin, POST /speak
-    // and GET /log.
+    // Peppe's own HTTP server, on port 8080: POST /speak/begin, POST /speak,
+    // GET /log and GET /version.
     //
     // It is separate from the web control server on port 80 because that one
     // keeps its handle private inside the servo_dog_ctrl managed component, so
@@ -319,7 +333,7 @@ private:
         config.ctrl_port = 32769;  // the web control server already owns the default one
         config.stack_size = 6144;
         config.max_open_sockets = 2;
-        config.max_uri_handlers = 3;
+        config.max_uri_handlers = 4;
         config.lru_purge_enable = true;
 
         httpd_handle_t server = nullptr;
@@ -335,6 +349,13 @@ private:
             .user_ctx = nullptr,
         };
         httpd_register_uri_handler(server, &log_uri);
+        static const httpd_uri_t version_uri = {
+            .uri = "/version",
+            .method = HTTP_GET,
+            .handler = VersionHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &version_uri);
         static const httpd_uri_t speak_uri = {
             .uri = "/speak",
             .method = HTTP_POST,
