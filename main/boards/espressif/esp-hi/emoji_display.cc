@@ -1,9 +1,13 @@
 #include "emoji_display.h"
 #include <esp_log.h>
+#include <algorithm>
 #include <cstring>
+#include <initializer_list>
 #include "assets.h"
 #include "assets/lang_config.h"
+#include "config.h"
 #include "display/lcd_display.h"
+#include "tiny_font.h"
 
 #include <esp_lcd_panel_io.h>
 #include <freertos/FreeRTOS.h>
@@ -25,6 +29,54 @@ static const std::unordered_map<std::string, std::string> emoji_asset_name_map =
     {"panic_loop", "panic_loop.aaf"}, {"blink_quick", "blink_quick.aaf"},
     {"scorn_loop", "scorn_loop.aaf"}};
 
+// Peppe: rows the eyes of blink_quick.aaf cover (measured on every frame: 27..52).
+// The Wi-Fi configuration screen writes its text in the free bands above and below.
+static constexpr int kEyesTop = 27;
+static constexpr int kEyesBottom = 53;
+static constexpr int kOverlayMargin = 2;
+static constexpr uint16_t kOverlayColor = 0xFFFF;  // white, same with or without byte swap
+
+static const uint8_t* GlyphFor(char ch) {
+    if (ch < tiny_font::kFirstChar || ch > tiny_font::kLastChar) {
+        ch = '?';
+    }
+    return &tiny_font::kGlyphs[(ch - tiny_font::kFirstChar) * tiny_font::kGlyphColumns];
+}
+
+// Glyphs are drawn proportionally: empty columns at their sides are dropped, so
+// that narrow glyphs such as "." or "i" do not waste a whole cell. A space keeps 3 columns.
+static void GlyphSpan(char ch, int& first, int& count) {
+    if (ch == ' ') {
+        first = 0;
+        count = 3;
+        return;
+    }
+    const uint8_t* cols = GlyphFor(ch);
+    int left = 0;
+    int right = tiny_font::kGlyphColumns;
+    while (left < right && cols[left] == 0) {
+        left++;
+    }
+    while (right > left && cols[right - 1] == 0) {
+        right--;
+    }
+    first = left;
+    count = right - left;
+}
+
+static int TextWidth(const std::string& text, int scale) {
+    int width = 0;
+    for (size_t i = 0; i < text.size(); i++) {
+        int first, count;
+        GlyphSpan(text[i], first, count);
+        width += count * scale;
+        if (i > 0) {
+            width += scale;  // one column between glyphs
+        }
+    }
+    return width;
+}
+
 bool EmojiPlayer::OnFlushIoReady(esp_lcd_panel_io_handle_t panel_io,
                                  esp_lcd_panel_io_event_data_t* edata, void* user_ctx) {
     anim_player_flush_ready(static_cast<anim_player_handle_t>(user_ctx));
@@ -33,16 +85,88 @@ bool EmojiPlayer::OnFlushIoReady(esp_lcd_panel_io_handle_t panel_io,
 
 void EmojiPlayer::OnFlush(anim_player_handle_t handle, int x_start, int y_start, int x_end,
                           int y_end, const void* color_data) {
-    auto* panel = static_cast<esp_lcd_panel_handle_t>(anim_player_get_user_data(handle));
-    esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, color_data);
+    auto* player = static_cast<EmojiPlayer*>(anim_player_get_user_data(handle));
+    // color_data is the player's own frame buffer, decoded again for every
+    // split of every frame, so the text can be written straight into it.
+    player->DrawOverlay(static_cast<uint16_t*>(const_cast<void*>(color_data)), x_end - x_start,
+                        y_start, y_end);
+    esp_lcd_panel_draw_bitmap(player->panel_, x_start, y_start, x_end, y_end, color_data);
 }
 
-EmojiPlayer::EmojiPlayer(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io) {
+EmojiPlayer::OverlayLine EmojiPlayer::LayoutLine(const std::string& text, int band_top,
+                                                 int band_bottom) {
+    OverlayLine line;
+    line.text = text;
+    if (text.empty()) {
+        return line;
+    }
+    // Double size when it fits, so the text can be read on the 0.96" screen.
+    line.scale = TextWidth(text, 2) <= DISPLAY_WIDTH - 2 * kOverlayMargin ? 2 : 1;
+    int width = TextWidth(text, line.scale);
+    int height = tiny_font::kGlyphRows * line.scale;
+    line.x = std::max(0, (DISPLAY_WIDTH - width) / 2);
+    line.y = band_top + std::max(0, (band_bottom - band_top - height) / 2);
+    return line;
+}
+
+void EmojiPlayer::SetOverlay(const std::string& top, const std::string& bottom) {
+    OverlayLine top_line = LayoutLine(top, 0, kEyesTop);
+    OverlayLine bottom_line = LayoutLine(bottom, kEyesBottom, DISPLAY_HEIGHT);
+    std::lock_guard<std::mutex> lock(overlay_mutex_);
+    overlay_top_ = std::move(top_line);
+    overlay_bottom_ = std::move(bottom_line);
+}
+
+void EmojiPlayer::ClearOverlay() {
+    std::lock_guard<std::mutex> lock(overlay_mutex_);
+    overlay_top_ = OverlayLine();
+    overlay_bottom_ = OverlayLine();
+}
+
+void EmojiPlayer::DrawOverlay(uint16_t* pixels, int width, int y_start, int y_end) {
+    std::lock_guard<std::mutex> lock(overlay_mutex_);
+    for (const OverlayLine* line : {&overlay_top_, &overlay_bottom_}) {
+        int height = tiny_font::kGlyphRows * line->scale;
+        if (line->text.empty() || line->y >= y_end || line->y + height <= y_start) {
+            continue;
+        }
+        int x = line->x;
+        for (char ch : line->text) {
+            int first, count;
+            GlyphSpan(ch, first, count);
+            const uint8_t* cols = GlyphFor(ch);
+            for (int c = 0; c < count; c++) {
+                uint8_t bits = (ch == ' ') ? 0 : cols[first + c];
+                for (int r = 0; bits != 0 && r < tiny_font::kGlyphRows; r++) {
+                    if (!(bits & (1 << r))) {
+                        continue;
+                    }
+                    for (int dy = 0; dy < line->scale; dy++) {
+                        int py = line->y + r * line->scale + dy;
+                        if (py < y_start || py >= y_end) {
+                            continue;
+                        }
+                        for (int dx = 0; dx < line->scale; dx++) {
+                            int px = x + c * line->scale + dx;
+                            if (px >= 0 && px < width) {
+                                pixels[(py - y_start) * width + px] = kOverlayColor;
+                            }
+                        }
+                    }
+                }
+            }
+            x += (count + 1) * line->scale;
+        }
+    }
+}
+
+EmojiPlayer::EmojiPlayer(esp_lcd_panel_handle_t panel, esp_lcd_panel_io_handle_t panel_io)
+    : panel_(panel) {
     ESP_LOGI(TAG, "Create EmojiPlayer, panel: %p, panel_io: %p", panel, panel_io);
 
     anim_player_config_t player_cfg = {.flush_cb = OnFlush,
                                        .update_cb = NULL,
-                                       .user_data = panel,
+                                       .user_data = this,
                                        .flags = {.swap = true},
                                        .task = ANIM_PLAYER_INIT_CONFIG()};
 
@@ -116,6 +240,10 @@ bool EmojiWidget::SetEmotion(const char* emotion) {
     if (!player_ || emotion == nullptr) {
         return false;
     }
+    if (wifi_config_shown_) {
+        // Keep the centred eyes of the Wi-Fi configuration screen under its text.
+        return true;
+    }
 
     using Param = std::tuple<std::string, bool, int>;
     static const std::unordered_map<std::string, Param> emotion_map = {
@@ -141,13 +269,31 @@ bool EmojiWidget::SetEmotion(const char* emotion) {
 }
 
 void EmojiWidget::SetStatus(const char* status) {
-    if (player_) {
+    if (player_ && !wifi_config_shown_) {
         if (strcmp(status, Lang::Strings::LISTENING) == 0) {
             player_->StartPlayer("asking", true, 15);
         } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
             player_->StartPlayer("wake", true, 15);
         }
     }
+}
+
+void EmojiWidget::ShowWifiConfig(const std::string& title, const std::string& ssid) {
+    if (!player_) {
+        return;
+    }
+    wifi_config_shown_ = true;
+    player_->SetOverlay(title, ssid);
+    player_->StartPlayer("blink_quick", true, 5);
+}
+
+void EmojiWidget::HideWifiConfig() {
+    if (!player_ || !wifi_config_shown_) {
+        return;
+    }
+    wifi_config_shown_ = false;
+    player_->ClearOverlay();
+    player_->StartPlayer("connecting", true, 15);
 }
 
 void EmojiWidget::InitializePlayer(esp_lcd_panel_handle_t panel,

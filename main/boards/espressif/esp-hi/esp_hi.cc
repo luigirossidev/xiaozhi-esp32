@@ -31,6 +31,7 @@
 #include "esp_hi_web_control.h"
 #include <esp_http_server.h>
 #include <esp_app_desc.h>
+#include <wifi_manager.h>
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -718,6 +719,37 @@ public:
     virtual Display* GetDisplay() override
     {
         return display_;
+    }
+
+    // Peppe: in Wi-Fi configuration mode, show "Peppe v<version>" above the
+    // eyes and the hotspot to join below them, next to the spoken prompt.
+    // The application's own handling of every event is kept unchanged.
+    virtual void SetNetworkEventCallback(NetworkEventCallback callback) override
+    {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                if (event == NetworkEvent::WifiConfigModeEnter) {
+                    // Events come from the Wi-Fi tasks; draw from the main task.
+                    Application::GetInstance().Schedule([this]() {
+                        std::string ssid = WifiManager::GetInstance().GetApSsid();
+                        if (display_ != nullptr && !ssid.empty()) {
+                            std::string title = "Peppe v";
+                            title += esp_app_get_description()->version;
+                            display_->ShowWifiConfig(title, ssid);
+                        }
+                    });
+                } else if (event == NetworkEvent::WifiConfigModeExit ||
+                           event == NetworkEvent::Connected) {
+                    Application::GetInstance().Schedule([this]() {
+                        if (display_ != nullptr) {
+                            display_->HideWifiConfig();
+                        }
+                    });
+                }
+                if (callback) {
+                    callback(event, data);
+                }
+            });
     }
 };
 
