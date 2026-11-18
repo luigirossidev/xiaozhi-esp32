@@ -4,6 +4,7 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "system_info.h"
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
@@ -163,15 +164,18 @@ private:
         return httpd_resp_send(req, snapshot.data(), size);
     }
 
-    // Peppe: firmware version, GET http://<ip>:8080/version.
+    // Peppe: firmware version and MAC address, GET http://<ip>:8080/version.
     //
-    // The mobile app compares it with the latest release published on the
-    // portal, to tell the user when an update is available. It is PROJECT_VER
-    // from the top-level CMakeLists.txt, e.g. {"version":"2.5.4"}.
+    // The mobile app compares the version with the latest release published on
+    // the portal, to tell the user when an update is available. It is
+    // CONFIG_APP_PROJECT_VER from this board's config.json. The MAC is the
+    // Wi-Fi station one, the same the device sends to the server as Device-Id,
+    // e.g. {"version":"1.0.0","mac":"a0:b1:c2:d3:e4:f5"}.
     static esp_err_t VersionHandler(httpd_req_t* req)
     {
-        char reply[64];
-        snprintf(reply, sizeof(reply), "{\"version\":\"%s\"}", esp_app_get_description()->version);
+        char reply[96];
+        snprintf(reply, sizeof(reply), "{\"version\":\"%s\",\"mac\":\"%s\"}",
+                 esp_app_get_description()->version, SystemInfo::GetMacAddress().c_str());
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, reply);
     }

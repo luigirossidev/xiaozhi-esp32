@@ -230,6 +230,7 @@ percorsi.
 
 | Percorso | Cosa fa |
 | --- | --- |
+| `GET /version` | Restituisce la versione del firmware e il MAC address Wi-Fi, per esempio `{"version":"1.0.0","mac":"a0:b1:c2:d3:e4:f5"}`. L'app confronta la versione con l'ultima pubblicata sul portale. Il MAC è lo stesso che il robot usa come `Device-Id` verso il server XiaoZhi. |
 | `GET /log` | Restituisce gli ultimi 4 kB di log. Con il corpo montato l'USB è occupata dai servo e la console è disattivata: questo è l'unico modo di vedere cosa succede. |
 | `POST /speak/begin` | Apre la conversazione col server e risponde solo quando il server è in ascolto. Corpo vuoto. |
 | `POST /speak` | Riceve pacchetti Opus e li inoltra all'assistente **al posto del microfono**, come una frase detta con il tasto premuto. È ciò che usa l'app per far dire a Peppe una frase scritta. |
