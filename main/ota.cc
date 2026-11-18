@@ -253,6 +253,14 @@ NetworkResult<> Ota::CheckVersion() {
             if (cJSON_IsNumber(force) && force->valueint == 1) {
                 has_new_version_ = true;
             }
+            // A partition table with a single app slot (e.g. partitions/v2/4m.csv) has nowhere
+            // to write a new image. Offering the update would only stop the audio, fail in
+            // Upgrade() and play an error alert on every boot.
+            if (has_new_version_ && esp_ota_get_next_update_partition(NULL) == NULL) {
+                ESP_LOGW(TAG, "Ignoring firmware %s: no OTA partition to write it to",
+                         firmware_version_.c_str());
+                has_new_version_ = false;
+            }
         }
     } else {
         ESP_LOGW(TAG, "No firmware section found!");
