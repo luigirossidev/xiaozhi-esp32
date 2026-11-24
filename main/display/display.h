@@ -49,6 +49,10 @@ public:
     // physical refresh has already completed. Callers are free to ignore the result.
     virtual bool SetEmotion(const char* emotion);
     virtual void SetChatMessage(const char* role, const char* content);
+    // The device activation code, shown while the device waits to be bound. The server
+    // message that carries it has already been passed to SetChatMessage(), so displays
+    // that show chat messages have nothing more to do.
+    virtual void ShowActivationCode(const std::string& code, const std::string& message) {}
     // Remove a matching message without clearing newer content, when supported.
     virtual void RemoveChatMessage(const char* role, const char* content) {}
     virtual void ClearChatMessages();
