@@ -30,7 +30,7 @@ static const std::unordered_map<std::string, std::string> emoji_asset_name_map =
     {"scorn_loop", "scorn_loop.aaf"}};
 
 // Peppe: rows the eyes of blink_quick.aaf cover (measured on every frame: 27..52).
-// The Wi-Fi configuration screen writes its text in the free bands above and below.
+// The text screens (Wi-Fi configuration, activation) write in the free bands above and below.
 static constexpr int kEyesTop = 27;
 static constexpr int kEyesBottom = 53;
 static constexpr int kOverlayMargin = 2;
@@ -94,14 +94,19 @@ void EmojiPlayer::OnFlush(anim_player_handle_t handle, int x_start, int y_start,
 }
 
 EmojiPlayer::OverlayLine EmojiPlayer::LayoutLine(const std::string& text, int band_top,
-                                                 int band_bottom) {
+                                                 int band_bottom, int max_scale) {
     OverlayLine line;
     line.text = text;
     if (text.empty()) {
         return line;
     }
-    // Double size when it fits, so the text can be read on the 0.96" screen.
-    line.scale = TextWidth(text, 2) <= DISPLAY_WIDTH - 2 * kOverlayMargin ? 2 : 1;
+    // As large as fits the band, so the text can be read on the 0.96" screen.
+    for (line.scale = max_scale; line.scale > 1; line.scale--) {
+        if (TextWidth(text, line.scale) <= DISPLAY_WIDTH - 2 * kOverlayMargin &&
+            tiny_font::kGlyphRows * line.scale <= band_bottom - band_top) {
+            break;
+        }
+    }
     int width = TextWidth(text, line.scale);
     int height = tiny_font::kGlyphRows * line.scale;
     line.x = std::max(0, (DISPLAY_WIDTH - width) / 2);
@@ -109,9 +114,10 @@ EmojiPlayer::OverlayLine EmojiPlayer::LayoutLine(const std::string& text, int ba
     return line;
 }
 
-void EmojiPlayer::SetOverlay(const std::string& top, const std::string& bottom) {
-    OverlayLine top_line = LayoutLine(top, 0, kEyesTop);
-    OverlayLine bottom_line = LayoutLine(bottom, kEyesBottom, DISPLAY_HEIGHT);
+void EmojiPlayer::SetOverlay(const std::string& top, const std::string& bottom,
+                             int bottom_max_scale) {
+    OverlayLine top_line = LayoutLine(top, 0, kEyesTop, 2);
+    OverlayLine bottom_line = LayoutLine(bottom, kEyesBottom, DISPLAY_HEIGHT, bottom_max_scale);
     std::lock_guard<std::mutex> lock(overlay_mutex_);
     overlay_top_ = std::move(top_line);
     overlay_bottom_ = std::move(bottom_line);
@@ -240,8 +246,8 @@ bool EmojiWidget::SetEmotion(const char* emotion) {
     if (!player_ || emotion == nullptr) {
         return false;
     }
-    if (wifi_config_shown_) {
-        // Keep the centred eyes of the Wi-Fi configuration screen under its text.
+    if (text_screen_ != TextScreen::kNone) {
+        // Keep the centred eyes of the text screen under its text.
         return true;
     }
 
@@ -269,7 +275,16 @@ bool EmojiWidget::SetEmotion(const char* emotion) {
 }
 
 void EmojiWidget::SetStatus(const char* status) {
-    if (player_ && !wifi_config_shown_) {
+    if (status == nullptr) {
+        return;
+    }
+    // The activation code stays up while the device waits for it to be entered;
+    // any other status means activation is over.
+    if (text_screen_ == TextScreen::kActivation &&
+        strcmp(status, Lang::Strings::ACTIVATION) != 0) {
+        HideTextScreen();
+    }
+    if (player_ && text_screen_ == TextScreen::kNone) {
         if (strcmp(status, Lang::Strings::LISTENING) == 0) {
             player_->StartPlayer("asking", true, 15);
         } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
@@ -278,20 +293,44 @@ void EmojiWidget::SetStatus(const char* status) {
     }
 }
 
-void EmojiWidget::ShowWifiConfig(const std::string& title, const std::string& ssid) {
-    if (!player_) {
-        return;
+void EmojiWidget::ShowActivationCode(const std::string& code, const std::string& message) {
+    // The server message is normally the site followed by the code on its own
+    // line ("xiaozhi.me\n123456"). Its first line goes on top, unless it is
+    // empty or already holds the code, in which case the status title is used.
+    std::string site = message.substr(0, message.find('\n'));
+    site.erase(0, site.find_first_not_of(" \t\r"));
+    site.erase(site.find_last_not_of(" \t\r") + 1);
+    if (site.empty() || site.find(code) != std::string::npos) {
+        site = Lang::Strings::ACTIVATION;
     }
-    wifi_config_shown_ = true;
-    player_->SetOverlay(title, ssid);
-    player_->StartPlayer("blink_quick", true, 5);
+    ShowTextScreen(TextScreen::kActivation, site, code, 3);
+}
+
+void EmojiWidget::ShowWifiConfig(const std::string& title, const std::string& ssid) {
+    ShowTextScreen(TextScreen::kWifiConfig, title, ssid, 2);
 }
 
 void EmojiWidget::HideWifiConfig() {
-    if (!player_ || !wifi_config_shown_) {
+    if (text_screen_ == TextScreen::kWifiConfig) {
+        HideTextScreen();
+    }
+}
+
+void EmojiWidget::ShowTextScreen(TextScreen screen, const std::string& top,
+                                 const std::string& bottom, int bottom_max_scale) {
+    if (!player_) {
         return;
     }
-    wifi_config_shown_ = false;
+    text_screen_ = screen;
+    player_->SetOverlay(top, bottom, bottom_max_scale);
+    player_->StartPlayer("blink_quick", true, 5);
+}
+
+void EmojiWidget::HideTextScreen() {
+    if (!player_ || text_screen_ == TextScreen::kNone) {
+        return;
+    }
+    text_screen_ = TextScreen::kNone;
     player_->ClearOverlay();
     player_->StartPlayer("connecting", true, 15);
 }
