@@ -33,7 +33,7 @@
                 "CONFIG_COMPILER_OPTIMIZATION_SIZE=y",
                 "CONFIG_CODEC_DATA_ADC_SUPPORT=y",
                 "CONFIG_APP_PROJECT_VER_FROM_CONFIG=y",
-                "CONFIG_APP_PROJECT_VER=\"1.0.1\""
+                "CONFIG_APP_PROJECT_VER=\"1.0.2\""
             ]
         }
     ]
