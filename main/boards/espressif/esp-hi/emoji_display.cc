@@ -36,46 +36,9 @@ static constexpr int kEyesBottom = 53;
 static constexpr int kOverlayMargin = 2;
 static constexpr uint16_t kOverlayColor = 0xFFFF;  // white, same with or without byte swap
 
-static const uint8_t* GlyphFor(char ch) {
-    if (ch < tiny_font::kFirstChar || ch > tiny_font::kLastChar) {
-        ch = '?';
-    }
-    return &tiny_font::kGlyphs[(ch - tiny_font::kFirstChar) * tiny_font::kGlyphColumns];
-}
-
-// Glyphs are drawn proportionally: empty columns at their sides are dropped, so
-// that narrow glyphs such as "." or "i" do not waste a whole cell. A space keeps 3 columns.
-static void GlyphSpan(char ch, int& first, int& count) {
-    if (ch == ' ') {
-        first = 0;
-        count = 3;
-        return;
-    }
-    const uint8_t* cols = GlyphFor(ch);
-    int left = 0;
-    int right = tiny_font::kGlyphColumns;
-    while (left < right && cols[left] == 0) {
-        left++;
-    }
-    while (right > left && cols[right - 1] == 0) {
-        right--;
-    }
-    first = left;
-    count = right - left;
-}
-
-static int TextWidth(const std::string& text, int scale) {
-    int width = 0;
-    for (size_t i = 0; i < text.size(); i++) {
-        int first, count;
-        GlyphSpan(text[i], first, count);
-        width += count * scale;
-        if (i > 0) {
-            width += scale;  // one column between glyphs
-        }
-    }
-    return width;
-}
+using tiny_font::GlyphFor;
+using tiny_font::GlyphSpan;
+using tiny_font::TextWidth;
 
 bool EmojiPlayer::OnFlushIoReady(esp_lcd_panel_io_handle_t panel_io,
                                  esp_lcd_panel_io_event_data_t* edata, void* user_ctx) {
@@ -88,8 +51,18 @@ void EmojiPlayer::OnFlush(anim_player_handle_t handle, int x_start, int y_start,
     auto* player = static_cast<EmojiPlayer*>(anim_player_get_user_data(handle));
     // color_data is the player's own frame buffer, decoded again for every
     // split of every frame, so the text can be written straight into it.
-    player->DrawOverlay(static_cast<uint16_t*>(const_cast<void*>(color_data)), x_end - x_start,
-                        y_start, y_end);
+    auto* pixels = static_cast<uint16_t*>(const_cast<void*>(color_data));
+    bool painted = false;
+    {
+        std::lock_guard<std::mutex> lock(player->overlay_mutex_);
+        if (player->painter_) {
+            player->painter_(pixels, x_end - x_start, y_start, y_end);
+            painted = true;
+        }
+    }
+    if (!painted) {
+        player->DrawOverlay(pixels, x_end - x_start, y_start, y_end);
+    }
     esp_lcd_panel_draw_bitmap(player->panel_, x_start, y_start, x_end, y_end, color_data);
 }
 
@@ -127,6 +100,11 @@ void EmojiPlayer::ClearOverlay() {
     std::lock_guard<std::mutex> lock(overlay_mutex_);
     overlay_top_ = OverlayLine();
     overlay_bottom_ = OverlayLine();
+}
+
+void EmojiPlayer::SetPainter(Painter painter) {
+    std::lock_guard<std::mutex> lock(overlay_mutex_);
+    painter_ = std::move(painter);
 }
 
 void EmojiPlayer::DrawOverlay(uint16_t* pixels, int width, int y_start, int y_end) {
@@ -246,8 +224,8 @@ bool EmojiWidget::SetEmotion(const char* emotion) {
     if (!player_ || emotion == nullptr) {
         return false;
     }
-    if (text_screen_ != TextScreen::kNone) {
-        // Keep the centred eyes of the text screen under its text.
+    if (text_screen_ != TextScreen::kNone || clock_shown_) {
+        // Keep the centred eyes of the text screen under its text, or the clock.
         return true;
     }
 
@@ -284,7 +262,7 @@ void EmojiWidget::SetStatus(const char* status) {
         strcmp(status, Lang::Strings::ACTIVATION) != 0) {
         HideTextScreen();
     }
-    if (player_ && text_screen_ == TextScreen::kNone) {
+    if (player_ && text_screen_ == TextScreen::kNone && !clock_shown_) {
         if (strcmp(status, Lang::Strings::LISTENING) == 0) {
             player_->StartPlayer("asking", true, 15);
         } else if (strcmp(status, Lang::Strings::STANDBY) == 0) {
@@ -322,6 +300,9 @@ void EmojiWidget::ShowTextScreen(TextScreen screen, const std::string& top,
         return;
     }
     text_screen_ = screen;
+    if (clock_shown_.exchange(false)) {
+        player_->SetPainter(nullptr);
+    }
     player_->SetOverlay(top, bottom, bottom_max_scale);
     player_->StartPlayer("blink_quick", true, 5);
 }
@@ -333,6 +314,25 @@ void EmojiWidget::HideTextScreen() {
     text_screen_ = TextScreen::kNone;
     player_->ClearOverlay();
     player_->StartPlayer("connecting", true, 15);
+}
+
+void EmojiWidget::ShowClock(EmojiPlayer::Painter painter) {
+    if (!player_ || text_screen_ != TextScreen::kNone) {
+        return;
+    }
+    player_->SetPainter(std::move(painter));
+    clock_shown_ = true;
+    // Any animation keeps the frames coming; the painter draws over all of it.
+    // 4 frames a second are enough for the blinking colon.
+    player_->StartPlayer("blink_quick", true, 4);
+}
+
+void EmojiWidget::HideClock() {
+    if (!player_ || !clock_shown_.exchange(false)) {
+        return;
+    }
+    player_->SetPainter(nullptr);
+    player_->StartPlayer("wake", true, 15);
 }
 
 void EmojiWidget::InitializePlayer(esp_lcd_panel_handle_t panel,

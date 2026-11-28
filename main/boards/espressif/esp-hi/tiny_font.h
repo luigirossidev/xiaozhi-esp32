@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 
 // Peppe: 5x8 bitmap font for printable ASCII (0x20..0x7E), used to write text
 // over the eye animation without pulling LVGL into this board.
@@ -115,5 +116,52 @@ inline constexpr uint8_t kGlyphs[] = {
 // clang-format on
 
 static_assert(sizeof(kGlyphs) == (kLastChar - kFirstChar + 1) * kGlyphColumns);
+
+// The 5 column bytes of a glyph; characters outside the font are drawn as '?'.
+inline const uint8_t* GlyphFor(char ch)
+{
+    if (ch < kFirstChar || ch > kLastChar) {
+        ch = '?';
+    }
+    return &kGlyphs[(ch - kFirstChar) * kGlyphColumns];
+}
+
+// Glyphs are drawn proportionally: empty columns at their sides are dropped, so
+// that narrow glyphs such as "." or "i" do not waste a whole cell. A space keeps
+// 3 columns.
+inline void GlyphSpan(char ch, int& first, int& count)
+{
+    if (ch == ' ') {
+        first = 0;
+        count = 3;
+        return;
+    }
+    const uint8_t* cols = GlyphFor(ch);
+    int left = 0;
+    int right = kGlyphColumns;
+    while (left < right && cols[left] == 0) {
+        left++;
+    }
+    while (right > left && cols[right - 1] == 0) {
+        right--;
+    }
+    first = left;
+    count = right - left;
+}
+
+// Width in pixels of text drawn at scale, with one column between glyphs.
+inline int TextWidth(std::string_view text, int scale)
+{
+    int width = 0;
+    for (size_t i = 0; i < text.size(); i++) {
+        int first, count;
+        GlyphSpan(text[i], first, count);
+        width += count * scale;
+        if (i > 0) {
+            width += scale;
+        }
+    }
+    return width;
+}
 
 }  // namespace tiny_font

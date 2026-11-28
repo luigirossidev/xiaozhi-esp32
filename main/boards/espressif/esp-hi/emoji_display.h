@@ -32,6 +32,13 @@ public:
     void SetOverlay(const std::string& top, const std::string& bottom, int bottom_max_scale = 2);
     void ClearOverlay();
 
+    // Peppe: draws whole frames instead of the animation, e.g. the clock. It
+    // is called from the player task for each band of rows [y_start, y_end)
+    // of every frame, with byte-swapped RGB565 pixels; nullptr goes back to the
+    // animation.
+    using Painter = std::function<void(uint16_t* pixels, int width, int y_start, int y_end)>;
+    void SetPainter(Painter painter);
+
 private:
     // One line of overlay text, laid out once when it is set.
     struct OverlayLine {
@@ -55,6 +62,7 @@ private:
     std::mutex overlay_mutex_;
     OverlayLine overlay_top_;
     OverlayLine overlay_bottom_;
+    Painter painter_;
 };
 
 class EmojiWidget : public Display {
@@ -76,6 +84,13 @@ public:
     void ShowWifiConfig(const std::string& title, const std::string& ssid);
     void HideWifiConfig();
 
+    // Peppe: clock screen, drawn by painter in place of the eyes. Emotions and
+    // statuses are ignored while it is shown; the Wi-Fi and activation screens
+    // replace it. HideClock() brings back the resting eyes.
+    void ShowClock(EmojiPlayer::Painter painter);
+    void HideClock();
+    bool IsClockShown() const { return clock_shown_; }
+
     anim::EmojiPlayer* GetPlayer()
     {
         return player_.get();
@@ -96,6 +111,7 @@ private:
     std::unique_ptr<anim::EmojiPlayer> player_;
     // Set from the main task and from the activation task.
     std::atomic<TextScreen> text_screen_{TextScreen::kNone};
+    std::atomic<bool> clock_shown_{false};
 };
 
 } // namespace anim

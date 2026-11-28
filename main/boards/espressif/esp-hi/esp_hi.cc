@@ -22,6 +22,8 @@
 #include "assets/lang_config.h"
 #include "anim_player.h"
 #include "emoji_display.h"
+#include "clock_face.h"
+#include "rome_time.h"
 #include "scanner_led.h"
 #include "servo_dog_ctrl.h"
 #include "led_strip.h"
@@ -38,6 +40,8 @@
 #include <esp_timer.h>
 #include <wifi_manager.h>
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -105,6 +109,25 @@ static const led_strip_rmt_config_t bsp_rmt_config = {
     }
 };
 
+// Peppe: the Led the application notifies on every device state change. It
+// drives the LED strip and lets the board react to the change too (clock).
+class PeppeStateLed : public Led {
+public:
+    PeppeStateLed(ScannerLed* strip, std::function<void()> on_state_changed)
+        : strip_(strip), on_state_changed_(std::move(on_state_changed))
+    {
+    }
+    void OnStateChanged() override
+    {
+        strip_->OnStateChanged();
+        on_state_changed_();
+    }
+
+private:
+    ScannerLed* strip_;
+    std::function<void()> on_state_changed_;
+};
+
 class EspHi : public WifiBoard {
 private:
     Button boot_button_;
@@ -113,6 +136,18 @@ private:
     anim::EmojiWidget* display_ = nullptr;
     bool web_server_initialized_ = false;
     ScannerLed* led_ = nullptr;
+    PeppeStateLed* state_led_ = nullptr;
+
+    // Peppe: clock mode. A 3-second press of BOOT while Peppe rests toggles it.
+    // A conversation hides the clock; it comes back kClockResumeMs after Peppe
+    // is at rest again. The choice is kept in NVS ("clock_on", off by default),
+    // so after a restart the clock comes back once Peppe is at rest. Only the
+    // main task touches clock_wanted_ after construction.
+    static constexpr uint16_t kClockLongPressMs = 3000;
+    static constexpr int kClockResumeMs = 4000;
+    bool clock_wanted_ = false;
+    esp_timer_handle_t clock_resume_timer_ = nullptr;
+    std::atomic<int> clock_style_{static_cast<int>(clock_face::kDefaultStyle)};
 
     // Peppe: display orientation, stored in NVS so that one firmware fits every
     // robot. Some batches have the screen mounted rotated by 180 degrees; for
@@ -144,6 +179,93 @@ private:
     {
         Settings settings(kDisplaySettings);
         return settings.GetBool("led_scanner", true);
+    }
+
+    // Peppe: clock style 1..4 (see clock_face::Style), 3 by default. Set with POST /clock.
+    static int LoadClockStyle()
+    {
+        Settings settings(kDisplaySettings);
+        int style = settings.GetInt("clock_style", static_cast<int>(clock_face::kDefaultStyle));
+        if (style < clock_face::kFirstStyle || style > clock_face::kLastStyle) {
+            style = static_cast<int>(clock_face::kDefaultStyle);
+        }
+        return style;
+    }
+
+    void ShowClock()
+    {
+        if (display_ == nullptr) {
+            return;
+        }
+        display_->ShowClock([this](uint16_t* pixels, int width, int y_start, int y_end) {
+            clock_face::Time time;
+            rome_time::Now(time);
+            clock_face::Paint(static_cast<clock_face::Style>(clock_style_.load()), time, pixels,
+                              width, y_start, y_end);
+        });
+    }
+
+    // Main task: the 3-second press of BOOT.
+    void ToggleClock()
+    {
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            return;
+        }
+        SetClockMode(!clock_wanted_);
+    }
+
+    // Main task: turn clock mode on or off and save the choice. At rest the
+    // screen changes at once; otherwise the clock follows once Peppe rests.
+    void SetClockMode(bool on)
+    {
+        clock_wanted_ = on;
+        {
+            Settings settings(kDisplaySettings, true);
+            settings.SetBool("clock_on", on);
+        }
+        ESP_LOGI(TAG, "Clock mode %s", on ? "on" : "off");
+        if (!on) {
+            if (clock_resume_timer_ != nullptr) {
+                esp_timer_stop(clock_resume_timer_);
+            }
+            if (display_ != nullptr) {
+                display_->HideClock();
+            }
+        } else if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+            ShowClock();
+        }
+    }
+
+    // Main task, on every device state change: hide the clock while Peppe is
+    // busy, bring it back a few seconds after Peppe is at rest again.
+    void OnDeviceStateChanged()
+    {
+        if (clock_resume_timer_ == nullptr) {
+            esp_timer_create_args_t args = {};
+            args.callback = [](void* arg) {
+                auto* self = static_cast<EspHi*>(arg);
+                Application::GetInstance().Schedule([self]() {
+                    if (self->clock_wanted_ &&
+                        Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                        self->ShowClock();
+                    }
+                });
+            };
+            args.arg = this;
+            args.name = "clock_resume";
+            if (esp_timer_create(&args, &clock_resume_timer_) != ESP_OK) {
+                clock_resume_timer_ = nullptr;
+                return;
+            }
+        }
+        esp_timer_stop(clock_resume_timer_);
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+            if (clock_wanted_ && display_ != nullptr && !display_->IsClockShown()) {
+                esp_timer_start_once(clock_resume_timer_, kClockResumeMs * 1000ULL);
+            }
+        } else if (display_ != nullptr) {
+            display_->HideClock();
+        }
     }
 
     // Restart from a short-lived task, after delay_ms, so that the caller can
@@ -316,6 +438,54 @@ private:
         // The panel is configured once at boot: restart once the reply is out.
         RestartLater(500);
         return err;
+    }
+
+    // Peppe: clock mode and style.
+    //   GET  /clock                     {"on":false,"style":3}
+    //   POST /clock?on=0|1&style=1..4   either or both; saved, applied at once
+    // on=1 shows the clock while Peppe rests (as the 3-second press of BOOT).
+    // Styles: 1 classic, 2 red LED, 3 colourful (default), 4 calendar.
+    static esp_err_t SendClockSettings(httpd_req_t* req, bool on, int style)
+    {
+        char reply[40];
+        snprintf(reply, sizeof(reply), "{\"on\":%s,\"style\":%d}", on ? "true" : "false", style);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, reply);
+    }
+
+    static esp_err_t ClockGetHandler(httpd_req_t* req)
+    {
+        bool on = Settings(kDisplaySettings).GetBool("clock_on", false);
+        return SendClockSettings(req, on, LoadClockStyle());
+    }
+
+    static esp_err_t ClockSetHandler(httpd_req_t* req)
+    {
+        int on = QueryInt(req, "on", -1);
+        int style = QueryInt(req, "style", -1);
+        bool style_ok = style >= clock_face::kFirstStyle && style <= clock_face::kLastStyle;
+        if ((on != -1 && on != 0 && on != 1) || (style != -1 && !style_ok) ||
+            (on == -1 && style == -1)) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"value\"}");
+        }
+        auto& self = static_cast<EspHi&>(Board::GetInstance());
+        if (style_ok) {
+            {
+                Settings settings(kDisplaySettings, true);
+                settings.SetInt("clock_style", style);
+            }
+            self.clock_style_ = style;
+            ESP_LOGI(TAG, "Clock style %d", style);
+        }
+        bool new_on = Settings(kDisplaySettings).GetBool("clock_on", false);
+        if (on != -1) {
+            new_on = on == 1;
+            // clock_wanted_ belongs to the main task.
+            Application::GetInstance().Schedule([&self, new_on]() { self.SetClockMode(new_on); });
+        }
+        return SendClockSettings(req, new_on, self.clock_style_.load());
     }
 
     // Peppe: LED strip scanner effect (red while listening, green while speaking).
@@ -498,7 +668,7 @@ private:
     }
 
     // Peppe's own HTTP server, on port 8080: POST /speak/begin, POST /speak,
-    // GET /log, GET /version, GET/POST /display and GET/POST /led.
+    // GET /log, GET /version, GET/POST /display, GET/POST /led and GET/POST /clock.
     //
     // It is separate from the web control server on port 80 because that one
     // keeps its handle private inside the servo_dog_ctrl managed component, so
@@ -510,7 +680,7 @@ private:
         config.ctrl_port = 32769;  // the web control server already owns the default one
         config.stack_size = 6144;
         config.max_open_sockets = 2;
-        config.max_uri_handlers = 8;
+        config.max_uri_handlers = 10;
         config.lru_purge_enable = true;
 
         httpd_handle_t server = nullptr;
@@ -561,6 +731,20 @@ private:
             .user_ctx = nullptr,
         };
         httpd_register_uri_handler(server, &led_set_uri);
+        static const httpd_uri_t clock_get_uri = {
+            .uri = "/clock",
+            .method = HTTP_GET,
+            .handler = ClockGetHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &clock_get_uri);
+        static const httpd_uri_t clock_set_uri = {
+            .uri = "/clock",
+            .method = HTTP_POST,
+            .handler = ClockSetHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &clock_set_uri);
         static const httpd_uri_t speak_uri = {
             .uri = "/speak",
             .method = HTTP_POST,
@@ -676,6 +860,11 @@ private:
             app.ToggleChatState();
         });
 
+        // Peppe: a 3-second press while at rest toggles the clock.
+        boot_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() { ToggleClock(); });
+        });
+
         audio_wake_button_.OnPressDown([this]() {
         });
 
@@ -700,6 +889,9 @@ private:
         ESP_ERROR_CHECK(led_strip_new_rmt_device(&bsp_strip_config, &bsp_rmt_config, &strip));
         led_ = new ScannerLed(strip);  // starts with the strip off
         led_->SetScannerEnabled(LoadLedScanner());
+        state_led_ = new PeppeStateLed(led_, [this]() { OnDeviceStateChanged(); });
+        clock_style_ = LoadClockStyle();
+        clock_wanted_ = Settings(kDisplaySettings).GetBool("clock_on", false);
     }
 
     void InitializeIot()
@@ -884,7 +1076,7 @@ private:
     }
 
 public:
-    EspHi() : boot_button_(BOOT_BUTTON_GPIO),
+    EspHi() : boot_button_(BOOT_BUTTON_GPIO, false, kClockLongPressMs),
         audio_wake_button_(AUDIO_WAKE_BUTTON_GPIO),
         move_wake_button_(MOVE_WAKE_BUTTON_GPIO)
     {
@@ -915,16 +1107,18 @@ public:
         return display_;
     }
 
-    // Peppe: in Wi-Fi configuration mode, show "Peppe v<version>" above the
-    // eyes and the hotspot to join below them, next to the spoken prompt.
-    // The application's own handling of every event is kept unchanged.
     virtual Led* GetLed() override
     {
-        if (led_ != nullptr) {
-            return led_;
+        if (state_led_ != nullptr) {
+            return state_led_;
         }
         return WifiBoard::GetLed();
     }
+
+    // Peppe: in Wi-Fi configuration mode, show "Peppe v<version>" above the
+    // eyes and the hotspot to join below them, next to the spoken prompt.
+    // Once connected, start the clock's time synchronisation.
+    // The application's own handling of every event is kept unchanged.
 
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) override
     {
@@ -943,6 +1137,9 @@ public:
                     });
                 } else if (event == NetworkEvent::WifiConfigModeExit ||
                            event == NetworkEvent::Connected) {
+                    if (event == NetworkEvent::Connected) {
+                        rome_time::StartSync();
+                    }
                     Application::GetInstance().Schedule([this]() {
                         if (display_ != nullptr) {
                             display_->HideWifiConfig();

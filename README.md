@@ -86,7 +86,8 @@ flash da 4 MB.
 
 Due modi, entrambi già nel firmware:
 
-- **Il pulsante BOOT** (GPIO 9): un clic avvia o interrompe la conversazione
+- **Il pulsante BOOT** (GPIO 9): un clic avvia o interrompe la conversazione. Tenuto premuto per 3
+  secondi a riposo, accende o spegne la [modalità orologio](#modalità-orologio)
 - **Il gesto**: una sequenza di tocchi sul sensore di movimento (GPIO 0) — una pausa lunga seguita da
   un tocco rapido — fa la stessa cosa senza toccare pulsanti, vedi
   [esp_hi.cc:139-164](main/boards/espressif/esp-hi/esp_hi.cc#L139-L164)
@@ -223,6 +224,28 @@ Il codice comune a tutte le board — protocolli, servizio audio, display, macch
 [main/](main/), e le note per chi sviluppa in [AGENTS.md](AGENTS.md). Il progetto segue lo stile C++
 di Google.
 
+## Modalità orologio
+
+Con Peppe a riposo, tieni premuto BOOT per 3 secondi: al posto degli occhi compaiono ora e data di
+Roma. Un'altra pressione di 3 secondi torna agli occhi. Se intanto parli con Peppe (un clic su BOOT,
+o il gesto), l'orologio sparisce durante la conversazione e torna da solo 4 secondi dopo che Peppe è
+di nuovo a riposo. La scelta resta salvata: se spegni Peppe con l'orologio acceso, alla riaccensione
+l'orologio torna da solo appena Peppe è a riposo. Di serie è spento.
+
+L'ora arriva da internet (SNTP, `pool.ntp.org`) e passa da sola fra ora solare e legale. Finché non è
+arrivata, al posto delle cifre compare `--:--`. Dall'app si accende e si spegne con
+`POST /clock?on=1` / `on=0`. Gli stili sono quattro e si scelgono con `POST /clock?style=N`:
+
+| N | Stile |
+| --- | --- |
+| 1 | Classico: ora bianca, data grigia su nero |
+| 2 | LED rosso: cifre a 7 segmenti e data completa |
+| 3 | Colorato: ore arancioni, minuti azzurri, giorno in un'etichetta gialla (predefinito) |
+| 4 | Calendario: foglio del calendario a sinistra, ora e anno a destra |
+
+Il disegno è in [clock_face.cc](main/boards/espressif/esp-hi/clock_face.cc), l'ora di Roma in
+[rome_time.cc](main/boards/espressif/esp-hi/rome_time.cc).
+
 ## Il server di Peppe (porta 8080)
 
 Oltre alla WebUI dei movimenti sulla porta 80, il firmware apre un secondo piccolo server HTTP sulla
@@ -237,6 +260,8 @@ percorsi.
 | `POST /display?flip=1` | Ruota lo schermo di 180°, per i robot che hanno il display montato capovolto (`flip=0` lo rimette com'era). La scelta resta salvata sul robot, che si riavvia per applicarla. Facoltativi `gap_x` e `gap_y` (0–80): spostano la finestra di 160×80 nella memoria del display, se dopo la rotazione l'immagine non è allineata. Corpo vuoto. |
 | `GET /led` | Dice se l'effetto scanner della striscia LED è attivo, per esempio `{"scanner":true}`. |
 | `POST /led?scanner=1` | Attiva l'effetto scanner della striscia LED sopra lo schermo: una luce rossa che va avanti e indietro mentre Peppe ascolta, verde mentre risponde. `scanner=0` lo disattiva. La scelta resta salvata e vale subito, senza riavvio. È attivo di serie. Corpo vuoto. |
+| `GET /clock` | Dice se la [modalità orologio](#modalità-orologio) è accesa e con che stile, per esempio `{"on":false,"style":3}`. |
+| `POST /clock?on=1&style=3` | Accende (`on=1`) o spegne (`on=0`) la modalità orologio e/o ne sceglie lo stile, da 1 a 4; basta uno dei due parametri. Fa lo stesso della pressione di 3 secondi su BOOT: se Peppe è a riposo lo schermo cambia subito, altrimenti appena torna a riposo. Le scelte restano salvate. Corpo vuoto. |
 | `GET /log` | Restituisce gli ultimi 4 kB di log. Con il corpo montato l'USB è occupata dai servo e la console è disattivata: questo è l'unico modo di vedere cosa succede. |
 | `POST /speak/begin` | Apre la conversazione col server e risponde solo quando il server è in ascolto. Corpo vuoto. |
 | `POST /speak` | Riceve pacchetti Opus e li inoltra all'assistente **al posto del microfono**, come una frase detta con il tasto premuto. È ciò che usa l'app per far dire a Peppe una frase scritta. |
