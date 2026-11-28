@@ -34,6 +34,7 @@
 #include <esp_http_server.h>
 #include <esp_app_desc.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <wifi_manager.h>
 #include <algorithm>
 #include <cstdarg>
@@ -149,6 +150,49 @@ private:
             },
             "peppe_restart", 2048, reinterpret_cast<void*>(static_cast<intptr_t>(delay_ms)), 5,
             nullptr);
+    }
+
+    // Peppe: restart on its own at the end of the first Wi-Fi setup.
+    //
+    // The config AP's POST /submit tests the credentials and saves them, but the
+    // robot stays in config mode until someone calls POST /exit. The browser
+    // page does that, the mobile app does not, so the robot had to be switched
+    // off and on again. When config mode starts with no network saved, poll the
+    // saved list (from NVS, which is safe across tasks) and restart once the
+    // first network appears. Later reconfigurations are left as they are.
+    static constexpr int kFirstSetupPollMs = 1000;
+    static constexpr int kFirstSetupRestartDelayMs = 2000;  // let /submit reply first
+    esp_timer_handle_t first_setup_timer_ = nullptr;
+
+    static bool HasSavedWifi()
+    {
+        Settings settings("wifi");  // SsidManager's namespace; "ssid" is the first entry
+        return !settings.GetString("ssid").empty();
+    }
+
+    void WatchFirstWifiSetup()
+    {
+        if (first_setup_timer_ != nullptr || HasSavedWifi()) {
+            return;
+        }
+        esp_timer_create_args_t args = {};
+        args.callback = [](void* arg) {
+            auto* self = static_cast<EspHi*>(arg);
+            if (!HasSavedWifi()) {
+                return;
+            }
+            esp_timer_stop(self->first_setup_timer_);
+            ESP_LOGI(TAG, "First Wi-Fi network saved, restarting");
+            RestartLater(kFirstSetupRestartDelayMs);
+        };
+        args.arg = this;
+        args.name = "first_setup";
+        if (esp_timer_create(&args, &first_setup_timer_) != ESP_OK) {
+            first_setup_timer_ = nullptr;
+            return;
+        }
+        esp_timer_start_periodic(first_setup_timer_, kFirstSetupPollMs * 1000ULL);
+        ESP_LOGI(TAG, "No Wi-Fi network saved: will restart after the first setup");
     }
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
@@ -839,6 +883,7 @@ public:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 if (event == NetworkEvent::WifiConfigModeEnter) {
+                    WatchFirstWifiSetup();
                     // Events come from the Wi-Fi tasks; draw from the main task.
                     Application::GetInstance().Schedule([this]() {
                         std::string ssid = WifiManager::GetInstance().GetApSsid();

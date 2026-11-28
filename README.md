@@ -177,6 +177,8 @@ movimento. È un aut-aut hardware, non una svista del firmware.
 
 Al primo avvio Peppe non conosce la rete, quindi crea un proprio hotspot Wi-Fi. Collegati con il
 telefono, scegli la tua rete e inserisci la password: la pagina di configurazione si apre da sola.
+Appena la password è verificata e salvata, Peppe si riavvia da solo e si collega alla rete. Lo fa
+solo la prima volta: se riconfiguri il Wi-Fi quando una rete è già salvata, il riavvio non scatta.
 
 Poi il dispositivo mostra un codice di attivazione da registrare sul server. Di default punta a
 [xiaozhi.me](https://xiaozhi.me), dove un account personale permette di usare gratuitamente il
