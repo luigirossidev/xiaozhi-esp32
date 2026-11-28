@@ -22,6 +22,7 @@
 #include "assets/lang_config.h"
 #include "anim_player.h"
 #include "emoji_display.h"
+#include "scanner_led.h"
 #include "servo_dog_ctrl.h"
 #include "led_strip.h"
 #include "driver/rmt_tx.h"
@@ -111,8 +112,7 @@ private:
     Button move_wake_button_;
     anim::EmojiWidget* display_ = nullptr;
     bool web_server_initialized_ = false;
-    led_strip_handle_t led_strip_;
-    bool led_on_ = false;
+    ScannerLed* led_ = nullptr;
 
     // Peppe: display orientation, stored in NVS so that one firmware fits every
     // robot. Some batches have the screen mounted rotated by 180 degrees; for
@@ -137,6 +137,13 @@ private:
         orientation.gap_y = std::clamp<int>(settings.GetInt("disp_gap_y", orientation.gap_y), 0,
                                             kMaxDisplayGap);
         return orientation;
+    }
+
+    // Peppe: scanner effect of the LED strip, on by default. Set with POST /led.
+    static bool LoadLedScanner()
+    {
+        Settings settings(kDisplaySettings);
+        return settings.GetBool("led_scanner", true);
     }
 
     // Restart from a short-lived task, after delay_ms, so that the caller can
@@ -311,6 +318,40 @@ private:
         return err;
     }
 
+    // Peppe: LED strip scanner effect (red while listening, green while speaking).
+    //   GET  /led             {"scanner":true}
+    //   POST /led?scanner=0|1 saves it and applies it at once, no restart
+    static esp_err_t SendLedSettings(httpd_req_t* req, bool scanner)
+    {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, scanner ? "{\"scanner\":true}" : "{\"scanner\":false}");
+    }
+
+    static esp_err_t LedGetHandler(httpd_req_t* req)
+    {
+        return SendLedSettings(req, LoadLedScanner());
+    }
+
+    static esp_err_t LedSetHandler(httpd_req_t* req)
+    {
+        int scanner = QueryInt(req, "scanner", -1);
+        if (scanner != 0 && scanner != 1) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"value\"}");
+        }
+        {
+            Settings settings(kDisplaySettings, true);
+            settings.SetBool("led_scanner", scanner == 1);
+        }
+        auto* led = static_cast<EspHi&>(Board::GetInstance()).led_;
+        if (led != nullptr) {
+            led->SetScannerEnabled(scanner == 1);
+        }
+        ESP_LOGI(TAG, "LED scanner %s", scanner == 1 ? "on" : "off");
+        return SendLedSettings(req, scanner == 1);
+    }
+
     // Peppe: "speak through the assistant" endpoint.
     //
     // POST http://<ip>:8080/speak with a body made of Opus packets, each one
@@ -457,7 +498,7 @@ private:
     }
 
     // Peppe's own HTTP server, on port 8080: POST /speak/begin, POST /speak,
-    // GET /log, GET /version and GET/POST /display.
+    // GET /log, GET /version, GET/POST /display and GET/POST /led.
     //
     // It is separate from the web control server on port 80 because that one
     // keeps its handle private inside the servo_dog_ctrl managed component, so
@@ -469,7 +510,7 @@ private:
         config.ctrl_port = 32769;  // the web control server already owns the default one
         config.stack_size = 6144;
         config.max_open_sockets = 2;
-        config.max_uri_handlers = 6;
+        config.max_uri_handlers = 8;
         config.lru_purge_enable = true;
 
         httpd_handle_t server = nullptr;
@@ -506,6 +547,20 @@ private:
             .user_ctx = nullptr,
         };
         httpd_register_uri_handler(server, &display_set_uri);
+        static const httpd_uri_t led_get_uri = {
+            .uri = "/led",
+            .method = HTTP_GET,
+            .handler = LedGetHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &led_get_uri);
+        static const httpd_uri_t led_set_uri = {
+            .uri = "/led",
+            .method = HTTP_POST,
+            .handler = LedSetHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &led_set_uri);
         static const httpd_uri_t speak_uri = {
             .uri = "/speak",
             .method = HTTP_POST,
@@ -641,30 +696,16 @@ private:
     void InitializeLed() {
         ESP_LOGI(TAG, "BLINK_GPIO setting %d", bsp_strip_config.strip_gpio_num);
 
-        ESP_ERROR_CHECK(led_strip_new_rmt_device(&bsp_strip_config, &bsp_rmt_config, &led_strip_));
-        led_strip_set_pixel(led_strip_, 0, 0x00, 0x00, 0x00);
-        led_strip_set_pixel(led_strip_, 1, 0x00, 0x00, 0x00);
-        led_strip_set_pixel(led_strip_, 2, 0x00, 0x00, 0x00);
-        led_strip_set_pixel(led_strip_, 3, 0x00, 0x00, 0x00);
-        led_strip_refresh(led_strip_);
-    }
-
-    esp_err_t SetLedColor(uint8_t r, uint8_t g, uint8_t b) {
-        esp_err_t ret = ESP_OK;
-
-        ret |= led_strip_set_pixel(led_strip_, 0, r, g, b);
-        ret |= led_strip_set_pixel(led_strip_, 1, r, g, b);
-        ret |= led_strip_set_pixel(led_strip_, 2, r, g, b);
-        ret |= led_strip_set_pixel(led_strip_, 3, r, g, b);
-        ret |= led_strip_refresh(led_strip_);
-        return ret;
+        led_strip_handle_t strip = nullptr;
+        ESP_ERROR_CHECK(led_strip_new_rmt_device(&bsp_strip_config, &bsp_rmt_config, &strip));
+        led_ = new ScannerLed(strip);  // starts with the strip off
+        led_->SetScannerEnabled(LoadLedScanner());
     }
 
     void InitializeIot()
     {
         ESP_LOGI(TAG, "Initialize Iot");
         InitializeLed();
-        SetLedColor(0x00, 0x00, 0x00);
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
         esp_event_loop_create_default();
@@ -813,18 +854,17 @@ private:
 
         // 灯光控制
         mcp_server.AddTool("self.light.get_power", "获取灯是否打开", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            return led_on_;
+            auto color = led_->GetManualColor();
+            return color.r != 0 || color.g != 0 || color.b != 0;
         });
 
         mcp_server.AddTool("self.light.turn_on", "打开灯", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            SetLedColor(0xFF, 0xFF, 0xFF);
-            led_on_ = true;
+            led_->SetManualColor({0xFF, 0xFF, 0xFF});
             return true;
         });
 
         mcp_server.AddTool("self.light.turn_off", "关闭灯", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            SetLedColor(0x00, 0x00, 0x00);
-            led_on_ = false;
+            led_->SetManualColor({0x00, 0x00, 0x00});
             return true;
         });
 
@@ -837,8 +877,8 @@ private:
             int g = properties["g"].value<int>();
             int b = properties["b"].value<int>();
 
-            led_on_ = true;
-            SetLedColor(r, g, b);
+            led_->SetManualColor({static_cast<uint8_t>(r), static_cast<uint8_t>(g),
+                                  static_cast<uint8_t>(b)});
             return true;
         });
     }
@@ -878,6 +918,14 @@ public:
     // Peppe: in Wi-Fi configuration mode, show "Peppe v<version>" above the
     // eyes and the hotspot to join below them, next to the spoken prompt.
     // The application's own handling of every event is kept unchanged.
+    virtual Led* GetLed() override
+    {
+        if (led_ != nullptr) {
+            return led_;
+        }
+        return WifiBoard::GetLed();
+    }
+
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) override
     {
         WifiBoard::SetNetworkEventCallback(

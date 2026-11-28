@@ -235,6 +235,8 @@ percorsi.
 | `GET /version` | Restituisce la versione del firmware e il MAC address Wi-Fi, per esempio `{"version":"1.0.0","mac":"a0:b1:c2:d3:e4:f5"}`. L'app confronta la versione con l'ultima pubblicata sul portale. Il MAC è lo stesso che il robot usa come `Device-Id` verso il server XiaoZhi. |
 | `GET /display` | Restituisce l'orientamento dello schermo, per esempio `{"flip":false,"gap_x":0,"gap_y":24}`. |
 | `POST /display?flip=1` | Ruota lo schermo di 180°, per i robot che hanno il display montato capovolto (`flip=0` lo rimette com'era). La scelta resta salvata sul robot, che si riavvia per applicarla. Facoltativi `gap_x` e `gap_y` (0–80): spostano la finestra di 160×80 nella memoria del display, se dopo la rotazione l'immagine non è allineata. Corpo vuoto. |
+| `GET /led` | Dice se l'effetto scanner della striscia LED è attivo, per esempio `{"scanner":true}`. |
+| `POST /led?scanner=1` | Attiva l'effetto scanner della striscia LED sopra lo schermo: una luce rossa che va avanti e indietro mentre Peppe ascolta, verde mentre risponde. `scanner=0` lo disattiva. La scelta resta salvata e vale subito, senza riavvio. È attivo di serie. Corpo vuoto. |
 | `GET /log` | Restituisce gli ultimi 4 kB di log. Con il corpo montato l'USB è occupata dai servo e la console è disattivata: questo è l'unico modo di vedere cosa succede. |
 | `POST /speak/begin` | Apre la conversazione col server e risponde solo quando il server è in ascolto. Corpo vuoto. |
 | `POST /speak` | Riceve pacchetti Opus e li inoltra all'assistente **al posto del microfono**, come una frase detta con il tasto premuto. È ciò che usa l'app per far dire a Peppe una frase scritta. |
