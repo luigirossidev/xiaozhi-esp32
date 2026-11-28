@@ -4,6 +4,7 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "settings.h"
 #include "system_info.h"
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -32,6 +33,7 @@
 #include "esp_hi_web_control.h"
 #include <esp_http_server.h>
 #include <esp_app_desc.h>
+#include <esp_system.h>
 #include <wifi_manager.h>
 #include <algorithm>
 #include <cstdarg>
@@ -111,6 +113,44 @@ private:
     led_strip_handle_t led_strip_;
     bool led_on_ = false;
 
+    // Peppe: display orientation, stored in NVS so that one firmware fits every
+    // robot. Some batches have the screen mounted rotated by 180 degrees; for
+    // those, "flip" inverts both mirror axes. The gap is where the 160x80 window
+    // sits in the controller memory; it can be overridden in case the flipped
+    // window does not line up. Set with POST /display on the Peppe server.
+    struct DisplayOrientation {
+        bool flip = false;
+        int gap_x = 0;
+        int gap_y = 24;
+    };
+    static constexpr const char* kDisplaySettings = "peppe";
+    static constexpr int kMaxDisplayGap = 80;
+
+    static DisplayOrientation LoadDisplayOrientation()
+    {
+        Settings settings(kDisplaySettings);
+        DisplayOrientation orientation;
+        orientation.flip = settings.GetBool("disp_flip", orientation.flip);
+        orientation.gap_x = std::clamp<int>(settings.GetInt("disp_gap_x", orientation.gap_x), 0,
+                                            kMaxDisplayGap);
+        orientation.gap_y = std::clamp<int>(settings.GetInt("disp_gap_y", orientation.gap_y), 0,
+                                            kMaxDisplayGap);
+        return orientation;
+    }
+
+    // Restart from a short-lived task, after delay_ms, so that the caller can
+    // finish what it is doing first (e.g. send its HTTP reply).
+    static void RestartLater(int delay_ms)
+    {
+        xTaskCreate(
+            [](void* arg) {
+                vTaskDelay(pdMS_TO_TICKS(reinterpret_cast<intptr_t>(arg)));
+                esp_restart();
+            },
+            "peppe_restart", 2048, reinterpret_cast<void*>(static_cast<intptr_t>(delay_ms)), 5,
+            nullptr);
+    }
+
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
     // Peppe: in-memory log, readable with GET http://<ip>:8080/log.
     //
@@ -178,6 +218,53 @@ private:
                  esp_app_get_description()->version, SystemInfo::GetMacAddress().c_str());
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, reply);
+    }
+
+    // Peppe: display orientation.
+    //   GET  /display                          {"flip":false,"gap_x":0,"gap_y":24}
+    //   POST /display?flip=1[&gap_x=N&gap_y=N] saves it and restarts the robot
+    // Parameters left out keep their current value.
+    static esp_err_t SendDisplayOrientation(httpd_req_t* req, const DisplayOrientation& orientation)
+    {
+        char reply[64];
+        snprintf(reply, sizeof(reply), "{\"flip\":%s,\"gap_x\":%d,\"gap_y\":%d}",
+                 orientation.flip ? "true" : "false", orientation.gap_x, orientation.gap_y);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, reply);
+    }
+
+    static esp_err_t DisplayGetHandler(httpd_req_t* req)
+    {
+        return SendDisplayOrientation(req, LoadDisplayOrientation());
+    }
+
+    static esp_err_t DisplaySetHandler(httpd_req_t* req)
+    {
+        DisplayOrientation orientation = LoadDisplayOrientation();
+        int flip = QueryInt(req, "flip", orientation.flip ? 1 : 0);
+        int gap_x = QueryInt(req, "gap_x", orientation.gap_x);
+        int gap_y = QueryInt(req, "gap_y", orientation.gap_y);
+        if ((flip != 0 && flip != 1) || gap_x < 0 || gap_x > kMaxDisplayGap || gap_y < 0 ||
+            gap_y > kMaxDisplayGap) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"value\"}");
+        }
+        orientation.flip = flip == 1;
+        orientation.gap_x = gap_x;
+        orientation.gap_y = gap_y;
+        {
+            Settings settings(kDisplaySettings, true);
+            settings.SetBool("disp_flip", orientation.flip);
+            settings.SetInt("disp_gap_x", orientation.gap_x);
+            settings.SetInt("disp_gap_y", orientation.gap_y);
+        }  // committed to NVS when settings goes out of scope
+        ESP_LOGI(TAG, "Display orientation saved: flip=%d gap=%d,%d, restarting",
+                 orientation.flip, orientation.gap_x, orientation.gap_y);
+        esp_err_t err = SendDisplayOrientation(req, orientation);
+        // The panel is configured once at boot: restart once the reply is out.
+        RestartLater(500);
+        return err;
     }
 
     // Peppe: "speak through the assistant" endpoint.
@@ -326,7 +413,7 @@ private:
     }
 
     // Peppe's own HTTP server, on port 8080: POST /speak/begin, POST /speak,
-    // GET /log and GET /version.
+    // GET /log, GET /version and GET/POST /display.
     //
     // It is separate from the web control server on port 80 because that one
     // keeps its handle private inside the servo_dog_ctrl managed component, so
@@ -338,7 +425,7 @@ private:
         config.ctrl_port = 32769;  // the web control server already owns the default one
         config.stack_size = 6144;
         config.max_open_sockets = 2;
-        config.max_uri_handlers = 4;
+        config.max_uri_handlers = 6;
         config.lru_purge_enable = true;
 
         httpd_handle_t server = nullptr;
@@ -361,6 +448,20 @@ private:
             .user_ctx = nullptr,
         };
         httpd_register_uri_handler(server, &version_uri);
+        static const httpd_uri_t display_get_uri = {
+            .uri = "/display",
+            .method = HTTP_GET,
+            .handler = DisplayGetHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &display_get_uri);
+        static const httpd_uri_t display_set_uri = {
+            .uri = "/display",
+            .method = HTTP_POST,
+            .handler = DisplaySetHandler,
+            .user_ctx = nullptr,
+        };
+        httpd_register_uri_handler(server, &display_set_uri);
         static const httpd_uri_t speak_uri = {
             .uri = "/speak",
             .method = HTTP_POST,
@@ -577,8 +678,13 @@ private:
         vTaskDelay(pdMS_TO_TICKS(120));
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
-        esp_lcd_panel_set_gap(panel, 0, 24);
-        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        const DisplayOrientation orientation = LoadDisplayOrientation();
+        ESP_LOGI(TAG, "Display orientation: flip=%d gap=%d,%d", orientation.flip,
+                 orientation.gap_x, orientation.gap_y);
+        esp_lcd_panel_set_gap(panel, orientation.gap_x, orientation.gap_y);
+        // Rotating by 180 degrees inverts both mirror axes.
+        esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X != orientation.flip,
+                             DISPLAY_MIRROR_Y != orientation.flip);
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         ESP_LOGI(TAG, "LCD panel create success, %p", panel);
 
